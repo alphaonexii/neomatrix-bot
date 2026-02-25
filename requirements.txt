@@ -1,4 +1,11 @@
-aiogram==2.25.1
+aiogram==2.25.1 --no-deps
+aiohttp==3.9.5
+yarl==1.9.4
+multidict==6.0.4
+async-timeout==4.0.3
+attrs==23.1.0
+frozenlist==1.4.0
+aiosignal==1.3.1
 asyncpg
 flask
 gunicorn
