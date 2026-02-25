@@ -7,4 +7,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY step2_bot.py .
 
-CMD ["python", "step2_bot.py"]
+CMD ["python", "step3_bot.py"]
