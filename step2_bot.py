@@ -26,7 +26,63 @@ dp.middleware.setup(LoggingMiddleware())
 active_battles = {}          # для временных битв
 memory_players = {}          # резервное хранилище в памяти (когда БД нет)
 
-# ---------- Работа с БД (оригинальные функции) ----------
+# ---------- Шаблоны врагов ----------
+ENEMY_TEMPLATES = [
+    {
+        'name': '🛡️ Дрон-охранник',
+        'base_health': 50,
+        'base_damage': 10,
+        'exp_reward': 15,
+        'credits_reward': 40,
+        'type': 'machine'
+    },
+    {
+        'name': '💻 Хакер',
+        'base_health': 40,
+        'base_damage': 12,
+        'exp_reward': 20,
+        'credits_reward': 50,
+        'type': 'hacker'
+    },
+    {
+        'name': '👾 Мутант',
+        'base_health': 70,
+        'base_damage': 15,
+        'exp_reward': 25,
+        'credits_reward': 70,
+        'type': 'mutant'
+    },
+    {
+        'name': '⚡ Элитный страж',
+        'base_health': 100,
+        'base_damage': 20,
+        'exp_reward': 40,
+        'credits_reward': 120,
+        'type': 'elite'
+    }
+]
+
+def generate_enemy(player_level):
+    """Генерирует врага с уровнем, близким к уровню игрока"""
+    template = random.choice(ENEMY_TEMPLATES)
+    enemy_level = max(1, player_level + random.randint(-1, 2))
+    multiplier = 1 + (enemy_level - 1) * 0.2  # +20% за уровень
+    health = int(template['base_health'] * multiplier)
+    damage = int(template['base_damage'] * multiplier)
+    exp = int(template['exp_reward'] * (1 + (enemy_level - 1) * 0.1))
+    credits = int(template['credits_reward'] * (1 + (enemy_level - 1) * 0.1))
+
+    return {
+        'name': f"{template['name']} (ур.{enemy_level})",
+        'health': health,
+        'damage': damage,
+        'exp': exp,
+        'credits': credits,
+        'level': enemy_level,
+        'type': template['type']
+    }
+
+# ---------- Работа с БД ----------
 async def init_db():
     if not DATABASE_URL:
         print("⚠️ DATABASE_URL не задана – работа без сохранения данных")
@@ -90,7 +146,6 @@ async def update_player_in_db(user_id, **kwargs):
 
 # ---------- Универсальные функции (БД + память) ----------
 def get_default_player(username=None):
-    """Возвращает словарь с начальными характеристиками игрока"""
     return {
         'level': 1,
         'exp': 0,
@@ -105,32 +160,19 @@ def get_default_player(username=None):
     }
 
 async def get_player_safe(user_id, username=None):
-    """
-    Возвращает игрока (словарь). Сначала пробует БД, если не получается – использует memory_players.
-    Если игрока нет в memory_players – создаёт там запись с начальными данными.
-    """
-    # Пробуем получить из БД
     db_player = await get_player_from_db(user_id)
     if db_player:
-        # Преобразуем запись из БД в обычный словарь (чтобы работать единообразно)
         return dict(db_player)
-
-    # Если БД недоступна или игрока там нет – работаем с памятью
     if user_id not in memory_players:
         memory_players[user_id] = get_default_player(username)
     return memory_players[user_id]
 
 async def update_player_safe(user_id, **kwargs):
-    """
-    Обновляет данные игрока. Пытается обновить в БД, если получится, и всегда обновляет в memory_players.
-    """
-    # Обновляем в памяти (если есть)
     if user_id in memory_players:
         memory_players[user_id].update(kwargs)
-    # Пробуем обновить в БД
     await update_player_in_db(user_id, **kwargs)
 
-# ---------- Команды бота (все используют безопасные функции) ----------
+# ---------- Команды бота ----------
 @dp.message_handler(commands=['start'])
 async def cmd_start(message: types.Message):
     user_id = message.from_user.id
@@ -169,7 +211,7 @@ async def cmd_battle(message: types.Message):
         await message.reply("⚡ Недостаточно энергии! Используй /daily")
         return
 
-    enemy = {"name": "🛡️ Дрон-охранник", "health": 50, "damage": 10, "exp": 15, "credits": 40}
+    enemy = generate_enemy(player['level'])
     battle_id = f"{user_id}_{datetime.now().timestamp()}"
     active_battles[battle_id] = {
         'player_id': user_id,
@@ -185,7 +227,10 @@ async def cmd_battle(message: types.Message):
         InlineKeyboardButton("🏃 Убежать", callback_data=f"run_{battle_id}")
     )
     await message.reply(
-        f"⚔️ **БИТВА**\n\nВраг: {enemy['name']}\n❤️ {enemy['health']}",
+        f"⚔️ **БИТВА**\n\nВраг: {enemy['name']}\n"
+        f"❤️ HP: {enemy['health']}\n"
+        f"⚔️ Урон врага: {enemy['damage']}\n"
+        f"🏆 Награда: +{enemy['exp']}✨ +{enemy['credits']}💰",
         reply_markup=keyboard,
         parse_mode="Markdown"
     )
@@ -205,26 +250,28 @@ async def attack(callback: types.CallbackQuery):
     if battle['enemy_hp'] <= 0:
         # Победа
         player = await get_player_safe(user_id)
-        new_exp = player['exp'] + 15
-        new_level = player['level']
-        new_credits = player['credits'] + 40
+        enemy = battle['enemy']
+        new_exp = player['exp'] + enemy['exp']
+        new_credits = player['credits'] + enemy['credits']
+        new_kills = player['monsters_killed'] + 1
         updates = {
             'exp': new_exp,
             'credits': new_credits,
-            'monsters_killed': player['monsters_killed'] + 1
+            'monsters_killed': new_kills
         }
+        level_up = ""
         if new_exp >= 100:
-            new_level += 1
+            new_level = player['level'] + 1
             updates['level'] = new_level
             updates['exp'] = new_exp - 100
             updates['max_health'] = player['max_health'] + 10
             updates['health'] = updates['max_health']
             level_up = "\n📈 **УРОВЕНЬ ПОВЫШЕН!**"
-        else:
-            level_up = ""
         await update_player_safe(user_id, **updates)
         del active_battles[battle_id]
-        await callback.message.edit_text(f"🎉 **ПОБЕДА!** +15✨ +40💰{level_up}")
+        await callback.message.edit_text(
+            f"🎉 **ПОБЕДА!** +{enemy['exp']}✨ +{enemy['credits']}💰{level_up}"
+        )
     else:
         await callback.message.edit_text(
             f"⚔️ Ты нанёс {damage} урона!\n❤️ У врага осталось: {battle['enemy_hp']}"
@@ -261,9 +308,8 @@ async def cmd_daily(message: types.Message):
 
 @dp.message_handler(commands=['top'])
 async def cmd_top(message: types.Message):
-    # Топ из памяти + из БД (если есть) – сложно объединить, пока оставим как было
     if not DATABASE_URL:
-        # Если БД нет, показываем топ из памяти
+        # Топ из памяти
         if not memory_players:
             await message.reply("Пока нет игроков")
             return
@@ -275,7 +321,6 @@ async def cmd_top(message: types.Message):
         await message.reply(text, parse_mode="Markdown")
         return
 
-    # Если БД есть, пробуем получить из неё
     try:
         conn = await asyncpg.connect(DATABASE_URL)
         rows = await conn.fetch('SELECT username, level, monsters_killed FROM players ORDER BY level DESC, monsters_killed DESC LIMIT 5')
