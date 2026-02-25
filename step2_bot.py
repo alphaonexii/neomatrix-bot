@@ -1,20 +1,23 @@
 import os
 import logging
 import random
+import threading
 from datetime import datetime, timedelta
-from aiohttp import web
+from flask import Flask, jsonify
 from aiogram import Bot, Dispatcher, types
 from aiogram.contrib.middlewares.logging import LoggingMiddleware
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 # ---------- Настройки ----------
 BOT_TOKEN = os.environ.get('BOT_TOKEN', '8689690200:AAH7rUhbaqh1RjBz-dqmJCyGE0wcDj3uGmw')
-WEBHOOK_HOST = os.environ.get('RENDER_EXTERNAL_URL', 'https://neomatrix-bot-docker.onrender.com')
-WEBHOOK_PATH = '/webhook'
-WEBHOOK_URL = f"{WEBHOOK_HOST}{WEBHOOK_PATH}"
 PORT = int(os.environ.get('PORT', 10000))
 
 logging.basicConfig(level=logging.INFO)
+
+# Создаём цикл событий
+import asyncio
+loop = asyncio.new_event_loop()
+asyncio.set_event_loop(loop)
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(bot)
@@ -25,47 +28,219 @@ players = {}
 active_battles = {}
 
 # ---------- Команды бота ----------
-# (весь код команд, который у тебя уже есть, остаётся без изменений)
-# Я не буду его дублировать здесь, чтобы не загромождать ответ,
-# но ты должен вставить сюда все свои обработчики (@dp.message_handler и @dp.callback_query_handler)
-# из предыдущего файла. Они у тебя уже есть, просто скопируй их.
+@dp.message_handler(commands=['start'])
+async def cmd_start(message: types.Message):
+    user_id = message.from_user.id
+    if user_id not in players:
+        players[user_id] = {
+            'level': 1,
+            'exp': 0,
+            'credits': 1000,
+            'health': 100,
+            'max_health': 100,
+            'energy': 100,
+            'max_energy': 100,
+            'last_daily': None,
+            'monsters_killed': 0
+        }
+    p = players[user_id]
+    await message.reply(
+        f"🌟 Добро пожаловать, {message.from_user.first_name}!\n"
+        f"Уровень: {p['level']} | Креды: {p['credits']}\n\n"
+        f"⚔️ /battle - Битва с монстрами\n"
+        f"📊 /profile - Профиль\n"
+        f"🎁 /daily - Бонус\n"
+        f"🏆 /top - Топ игроков\n"
+        f"🏪 /shop - Магазин"
+    )
 
-# ВНИМАНИЕ: вставь сюда весь блок команд, который был в твоём последнем сообщении
-# (от @dp.message_handler(commands=['start']) до последнего обработчика перед комментарием # ---------- Вебхук ----------)
+@dp.message_handler(commands=['profile'])
+async def cmd_profile(message: types.Message):
+    user_id = message.from_user.id
+    if user_id not in players:
+        await message.reply("Сначала введи /start")
+        return
+    p = players[user_id]
+    await message.reply(
+        f"📊 **ПРОФИЛЬ**\n\n"
+        f"Уровень: {p['level']}\n"
+        f"Опыт: {p['exp']}/100\n"
+        f"❤️ HP: {p['health']}/{p['max_health']}\n"
+        f"⚡ Энергия: {p['energy']}/{p['max_energy']}\n"
+        f"💰 Креды: {p['credits']}\n"
+        f"👾 Убито монстров: {p['monsters_killed']}",
+        parse_mode="Markdown"
+    )
 
-# ---------- Вебхук (обработчик POST-запросов) ----------
-async def webhook_handler(request):
-    """Принимает POST-запросы от Telegram и передаёт их диспетчеру"""
-    try:
-        update_data = await request.json()
-        update = types.Update(**update_data)
-        await dp.process_update(update)
-        return web.Response(status=200)
-    except Exception as e:
-        logging.error(f"Ошибка при обработке вебхука: {e}")
-        return web.Response(status=500)
+@dp.message_handler(commands=['battle'])
+async def cmd_battle(message: types.Message):
+    user_id = message.from_user.id
+    if user_id not in players:
+        await message.reply("Сначала введи /start")
+        return
+    p = players[user_id]
+    if p['energy'] < 10:
+        await message.reply("⚡ Недостаточно энергии! Используй /daily")
+        return
 
-# ---------- Запуск приложения ----------
-async def on_startup(app):
-    # Устанавливаем вебхук и проверяем результат
-    result = await bot.set_webhook(WEBHOOK_URL)
-    if result:
-        print(f"✅ Webhook успешно установлен на {WEBHOOK_URL}")
+    enemy = {"name": "🛡️ Дрон-охранник", "health": 50, "damage": 10, "exp": 15, "credits": 40}
+    battle_id = f"{user_id}_{datetime.now().timestamp()}"
+    active_battles[battle_id] = {
+        'player_id': user_id,
+        'enemy': enemy,
+        'enemy_hp': enemy['health']
+    }
+
+    p['energy'] -= 10
+
+    keyboard = InlineKeyboardMarkup(row_width=2)
+    keyboard.add(
+        InlineKeyboardButton("⚔️ Атака", callback_data=f"attack_{battle_id}"),
+        InlineKeyboardButton("🏃 Убежать", callback_data=f"run_{battle_id}")
+    )
+    await message.reply(
+        f"⚔️ **БИТВА**\n\nВраг: {enemy['name']}\n❤️ {enemy['health']}",
+        reply_markup=keyboard,
+        parse_mode="Markdown"
+    )
+
+@dp.callback_query_handler(lambda c: c.data.startswith('attack_'))
+async def attack(callback: types.CallbackQuery):
+    battle_id = callback.data.replace('attack_', '')
+    if battle_id not in active_battles:
+        await callback.message.reply("⚠️ Битва уже закончена")
+        await callback.answer()
+        return
+    battle = active_battles[battle_id]
+    user_id = battle['player_id']
+    damage = random.randint(15, 25)
+    battle['enemy_hp'] -= damage
+
+    if battle['enemy_hp'] <= 0:
+        # Победа
+        p = players[user_id]
+        p['exp'] += 15
+        p['credits'] += 40
+        p['monsters_killed'] += 1
+        if p['exp'] >= 100:
+            p['level'] += 1
+            p['exp'] -= 100
+            p['max_health'] += 10
+            p['health'] = p['max_health']
+            level_up = "\n📈 **УРОВЕНЬ ПОВЫШЕН!**"
+        else:
+            level_up = ""
+        del active_battles[battle_id]
+        await callback.message.edit_text(f"🎉 **ПОБЕДА!** +15✨ +40💰{level_up}")
     else:
-        print(f"❌ Ошибка при установке вебхука!")
-    # Дополнительно выводим информацию о вебхуке для проверки
-    info = await bot.get_webhook_info()
-    print(f"📊 Информация о вебхуке: url={info.url}, pending_updates={info.pending_update_count}")
+        await callback.message.edit_text(
+            f"⚔️ Ты нанёс {damage} урона!\n❤️ У врага осталось: {battle['enemy_hp']}"
+        )
+    await callback.answer()
 
-async def on_shutdown(app):
-    await bot.delete_webhook()
-    print("👋 Webhook удалён")
+@dp.callback_query_handler(lambda c: c.data.startswith('run_'))
+async def run(callback: types.CallbackQuery):
+    battle_id = callback.data.replace('run_', '')
+    if battle_id in active_battles:
+        del active_battles[battle_id]
+    await callback.message.edit_text("🏃 Ты убежал с поля боя")
+    await callback.answer()
 
-app = web.Application()
-app.router.add_post(WEBHOOK_PATH, webhook_handler)  # только POST на /webhook
-app.on_startup.append(on_startup)
-app.on_shutdown.append(on_shutdown)
+@dp.message_handler(commands=['daily'])
+async def cmd_daily(message: types.Message):
+    user_id = message.from_user.id
+    if user_id not in players:
+        await message.reply("Сначала введи /start")
+        return
+    p = players[user_id]
+    now = datetime.now()
+    if p['last_daily'] and (now - p['last_daily']) < timedelta(days=1):
+        left = timedelta(days=1) - (now - p['last_daily'])
+        hours = left.seconds // 3600
+        await message.reply(f"⏳ Бонус через {hours}ч")
+    else:
+        bonus = 100 + p['level'] * 10
+        p['credits'] += bonus
+        p['energy'] = p['max_energy']
+        p['health'] = p['max_health']
+        p['last_daily'] = now
+        await message.reply(f"🎁 Получено {bonus}💰 и полная энергия!")
 
+@dp.message_handler(commands=['top'])
+async def cmd_top(message: types.Message):
+    if not players:
+        await message.reply("Пока нет игроков")
+        return
+    top = sorted(players.items(), key=lambda x: x[1]['level'], reverse=True)[:5]
+    text = "🏆 **ТОП ИГРОКОВ**\n\n"
+    for i, (uid, p) in enumerate(top, 1):
+        name = f"Игрок{uid}"
+        text += f"{i}. {name} - Ур.{p['level']} (👾 {p['monsters_killed']})\n"
+    await message.reply(text, parse_mode="Markdown")
+
+@dp.message_handler(commands=['shop'])
+async def cmd_shop(message: types.Message):
+    keyboard = InlineKeyboardMarkup(row_width=2)
+    keyboard.add(
+        InlineKeyboardButton("❤️ Лечение (50💰)", callback_data="buy_heal"),
+        InlineKeyboardButton("⚡ Энергия (30💰)", callback_data="buy_energy")
+    )
+    await message.reply(
+        "🏪 **МАГАЗИН**\n\n"
+        "❤️ Лечение - +50 HP (50💰)\n"
+        "⚡ Энергия - +30 энергии (30💰)",
+        reply_markup=keyboard,
+        parse_mode="Markdown"
+    )
+
+@dp.callback_query_handler(lambda c: c.data.startswith('buy_'))
+async def buy(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    if user_id not in players:
+        await callback.message.reply("Сначала введи /start")
+        await callback.answer()
+        return
+    p = players[user_id]
+    action = callback.data.split('_')[1]
+
+    if action == "heal":
+        if p['credits'] >= 50:
+            p['credits'] -= 50
+            p['health'] = min(p['max_health'], p['health'] + 50)
+            await callback.message.reply("❤️ Здоровье восстановлено!")
+        else:
+            await callback.message.reply("❌ Недостаточно кредов!")
+    elif action == "energy":
+        if p['credits'] >= 30:
+            p['credits'] -= 30
+            p['energy'] = min(p['max_energy'], p['energy'] + 30)
+            await callback.message.reply("⚡ Энергия восстановлена!")
+        else:
+            await callback.message.reply("❌ Недостаточно кредов!")
+    await callback.answer()
+
+# ---------- Flask для health check (чтобы Render видел открытый порт) ----------
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return jsonify({"status": "Bot is running!", "time": datetime.now().isoformat()})
+
+@app.route('/health')
+def health():
+    return jsonify({"status": "healthy"}), 200
+
+def run_flask():
+    app.run(host='0.0.0.0', port=PORT, debug=False, use_reloader=False)
+
+# ---------- Запуск ----------
 if __name__ == '__main__':
-    print(f"🚀 Запуск сервера на порту {PORT}")
-    web.run_app(app, host='0.0.0.0', port=PORT)
+    # Запускаем Flask в отдельном потоке
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+    print(f"🚀 Flask запущен в фоновом потоке на порту {PORT}")
+
+    # Запускаем бота в основном потоке (polling)
+    from aiogram import executor
+    print("🚀 Запуск бота в режиме polling...")
+    executor.start_polling(dp, skip_updates=True, loop=loop)
