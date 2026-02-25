@@ -5,6 +5,6 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY minimal.py .
+COPY step2_bot.py .
 
-CMD ["python", "minimal.py"]
+CMD ["python", "step2_bot.py"]
