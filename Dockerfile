@@ -5,6 +5,8 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY step2_bot.py .
+# Копируем все Python-скрипты
+COPY *.py .
 
+# Запускаем новый файл с PvP
 CMD ["python", "step3_bot.py"]
