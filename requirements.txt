@@ -1,5 +1,5 @@
 aiogram==2.25.1
-aiohttp==3.9.5 --only-binary :all:
+aiohttp==3.13.2 --only-binary :all:
 asyncpg
 flask
 gunicorn
