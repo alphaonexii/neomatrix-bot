@@ -22,9 +22,11 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(bot)
 dp.middleware.setup(LoggingMiddleware())
 
-active_battles = {}  # словарь для временных битв (в памяти)
+# Хранилища
+active_battles = {}          # для временных битв
+memory_players = {}          # резервное хранилище в памяти (когда БД нет)
 
-# ---------- Работа с БД (с защитой) ----------
+# ---------- Работа с БД (оригинальные функции) ----------
 async def init_db():
     if not DATABASE_URL:
         print("⚠️ DATABASE_URL не задана – работа без сохранения данных")
@@ -51,7 +53,7 @@ async def init_db():
     except Exception as e:
         print(f"❌ Ошибка подключения к БД: {e}")
 
-async def get_player(user_id):
+async def get_player_from_db(user_id):
     if not DATABASE_URL:
         return None
     try:
@@ -62,7 +64,7 @@ async def get_player(user_id):
     except:
         return None
 
-async def create_player(user_id, username):
+async def create_player_in_db(user_id, username):
     if not DATABASE_URL:
         return
     try:
@@ -74,7 +76,7 @@ async def create_player(user_id, username):
     except:
         pass
 
-async def update_player(user_id, **kwargs):
+async def update_player_in_db(user_id, **kwargs):
     if not DATABASE_URL:
         return
     try:
@@ -86,15 +88,54 @@ async def update_player(user_id, **kwargs):
     except:
         pass
 
-# ---------- Команды бота ----------
+# ---------- Универсальные функции (БД + память) ----------
+def get_default_player(username=None):
+    """Возвращает словарь с начальными характеристиками игрока"""
+    return {
+        'level': 1,
+        'exp': 0,
+        'credits': 1000,
+        'health': 100,
+        'max_health': 100,
+        'energy': 100,
+        'max_energy': 100,
+        'monsters_killed': 0,
+        'last_daily': None,
+        'username': username
+    }
+
+async def get_player_safe(user_id, username=None):
+    """
+    Возвращает игрока (словарь). Сначала пробует БД, если не получается – использует memory_players.
+    Если игрока нет в memory_players – создаёт там запись с начальными данными.
+    """
+    # Пробуем получить из БД
+    db_player = await get_player_from_db(user_id)
+    if db_player:
+        # Преобразуем запись из БД в обычный словарь (чтобы работать единообразно)
+        return dict(db_player)
+
+    # Если БД недоступна или игрока там нет – работаем с памятью
+    if user_id not in memory_players:
+        memory_players[user_id] = get_default_player(username)
+    return memory_players[user_id]
+
+async def update_player_safe(user_id, **kwargs):
+    """
+    Обновляет данные игрока. Пытается обновить в БД, если получится, и всегда обновляет в memory_players.
+    """
+    # Обновляем в памяти (если есть)
+    if user_id in memory_players:
+        memory_players[user_id].update(kwargs)
+    # Пробуем обновить в БД
+    await update_player_in_db(user_id, **kwargs)
+
+# ---------- Команды бота (все используют безопасные функции) ----------
 @dp.message_handler(commands=['start'])
 async def cmd_start(message: types.Message):
     user_id = message.from_user.id
     username = message.from_user.username or "NoName"
-    player = await get_player(user_id)
-    if not player:
-        await create_player(user_id, username)
-        player = await get_player(user_id)
+    player = await get_player_safe(user_id, username)
     await message.reply(
         f"🌟 Добро пожаловать, {message.from_user.first_name}!\n"
         f"Уровень: {player['level']} | Креды: {player['credits']}\n\n"
@@ -108,10 +149,7 @@ async def cmd_start(message: types.Message):
 @dp.message_handler(commands=['profile'])
 async def cmd_profile(message: types.Message):
     user_id = message.from_user.id
-    player = await get_player(user_id)
-    if not player:
-        await message.reply("Сначала введи /start")
-        return
+    player = await get_player_safe(user_id)
     await message.reply(
         f"📊 **ПРОФИЛЬ**\n\n"
         f"Уровень: {player['level']}\n"
@@ -126,10 +164,7 @@ async def cmd_profile(message: types.Message):
 @dp.message_handler(commands=['battle'])
 async def cmd_battle(message: types.Message):
     user_id = message.from_user.id
-    player = await get_player(user_id)
-    if not player:
-        await message.reply("Сначала введи /start")
-        return
+    player = await get_player_safe(user_id)
     if player['energy'] < 10:
         await message.reply("⚡ Недостаточно энергии! Используй /daily")
         return
@@ -142,7 +177,7 @@ async def cmd_battle(message: types.Message):
         'enemy_hp': enemy['health']
     }
 
-    await update_player(user_id, energy=player['energy'] - 10)
+    await update_player_safe(user_id, energy=player['energy'] - 10)
 
     keyboard = InlineKeyboardMarkup(row_width=2)
     keyboard.add(
@@ -169,31 +204,25 @@ async def attack(callback: types.CallbackQuery):
 
     if battle['enemy_hp'] <= 0:
         # Победа
-        player = await get_player(user_id)
+        player = await get_player_safe(user_id)
         new_exp = player['exp'] + 15
         new_level = player['level']
         new_credits = player['credits'] + 40
+        updates = {
+            'exp': new_exp,
+            'credits': new_credits,
+            'monsters_killed': player['monsters_killed'] + 1
+        }
         if new_exp >= 100:
             new_level += 1
-            new_exp -= 100
-            new_max_health = player['max_health'] + 10
-            new_health = new_max_health
-            await update_player(user_id,
-                exp=new_exp,
-                level=new_level,
-                credits=new_credits,
-                max_health=new_max_health,
-                health=new_health,
-                monsters_killed=player['monsters_killed'] + 1
-            )
+            updates['level'] = new_level
+            updates['exp'] = new_exp - 100
+            updates['max_health'] = player['max_health'] + 10
+            updates['health'] = updates['max_health']
             level_up = "\n📈 **УРОВЕНЬ ПОВЫШЕН!**"
         else:
-            await update_player(user_id,
-                exp=new_exp,
-                credits=new_credits,
-                monsters_killed=player['monsters_killed'] + 1
-            )
             level_up = ""
+        await update_player_safe(user_id, **updates)
         del active_battles[battle_id]
         await callback.message.edit_text(f"🎉 **ПОБЕДА!** +15✨ +40💰{level_up}")
     else:
@@ -213,10 +242,7 @@ async def run(callback: types.CallbackQuery):
 @dp.message_handler(commands=['daily'])
 async def cmd_daily(message: types.Message):
     user_id = message.from_user.id
-    player = await get_player(user_id)
-    if not player:
-        await message.reply("Сначала введи /start")
-        return
+    player = await get_player_safe(user_id)
     now = datetime.now()
     last = player['last_daily']
     if last and (now - last) < timedelta(days=1):
@@ -225,7 +251,7 @@ async def cmd_daily(message: types.Message):
         await message.reply(f"⏳ Бонус через {hours}ч")
     else:
         bonus = 100 + player['level'] * 10
-        await update_player(user_id,
+        await update_player_safe(user_id,
             credits=player['credits'] + bonus,
             energy=player['max_energy'],
             health=player['max_health'],
@@ -235,9 +261,21 @@ async def cmd_daily(message: types.Message):
 
 @dp.message_handler(commands=['top'])
 async def cmd_top(message: types.Message):
+    # Топ из памяти + из БД (если есть) – сложно объединить, пока оставим как было
     if not DATABASE_URL:
-        await message.reply("Топ недоступен без базы данных")
+        # Если БД нет, показываем топ из памяти
+        if not memory_players:
+            await message.reply("Пока нет игроков")
+            return
+        sorted_players = sorted(memory_players.items(), key=lambda x: x[1]['level'], reverse=True)[:5]
+        text = "🏆 **ТОП ИГРОКОВ (в памяти)**\n\n"
+        for i, (uid, p) in enumerate(sorted_players, 1):
+            name = p.get('username') or f"Игрок{uid}"
+            text += f"{i}. {name} - Ур.{p['level']} (👾 {p['monsters_killed']})\n"
+        await message.reply(text, parse_mode="Markdown")
         return
+
+    # Если БД есть, пробуем получить из неё
     try:
         conn = await asyncpg.connect(DATABASE_URL)
         rows = await conn.fetch('SELECT username, level, monsters_killed FROM players ORDER BY level DESC, monsters_killed DESC LIMIT 5')
@@ -271,16 +309,12 @@ async def cmd_shop(message: types.Message):
 @dp.callback_query_handler(lambda c: c.data.startswith('buy_'))
 async def buy(callback: types.CallbackQuery):
     user_id = callback.from_user.id
-    player = await get_player(user_id)
-    if not player:
-        await callback.message.reply("Сначала введи /start")
-        await callback.answer()
-        return
+    player = await get_player_safe(user_id)
     action = callback.data.split('_')[1]
     if action == "heal":
         if player['credits'] >= 50:
             new_health = min(player['max_health'], player['health'] + 50)
-            await update_player(user_id,
+            await update_player_safe(user_id,
                 credits=player['credits'] - 50,
                 health=new_health
             )
@@ -290,7 +324,7 @@ async def buy(callback: types.CallbackQuery):
     elif action == "energy":
         if player['credits'] >= 30:
             new_energy = min(player['max_energy'], player['energy'] + 30)
-            await update_player(user_id,
+            await update_player_safe(user_id,
                 credits=player['credits'] - 30,
                 energy=new_energy
             )
@@ -315,16 +349,13 @@ def run_flask():
 
 # ---------- Запуск ----------
 if __name__ == '__main__':
-    # Инициализация цикла событий
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     loop.run_until_complete(init_db())
 
-    # Запуск Flask в фоновом потоке
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
     print(f"🚀 Flask запущен в фоновом потоке на порту {PORT}")
 
-    # Запуск бота (polling)
     print("🚀 Запуск бота в режиме polling...")
     executor.start_polling(dp, skip_updates=True, loop=loop)
