@@ -427,8 +427,15 @@ async def process_buy(callback_query: types.CallbackQuery):
 
 # ========== ЗАПУСК ==========
 def run_bot():
-    from aiogram import executor
-    executor.start_polling(dp, skip_updates=True, loop=loop)
+    try:
+        from aiogram import executor
+        print("🚀 Запускаем бота в фоновом потоке...")
+        executor.start_polling(dp, skip_updates=True, loop=loop)
+        print("✅ Бот успешно запущен и работает")
+    except Exception as e:
+        print(f"❌ КРИТИЧЕСКАЯ ОШИБКА В ПОТОКЕ БОТА: {e}")
+        import traceback
+        traceback.print_exc()
 
 if __name__ == '__main__':
     # Инициализируем базу данных
