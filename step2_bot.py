@@ -2,6 +2,7 @@ import os
 import logging
 import random
 import threading
+import asyncio
 import asyncpg
 from datetime import datetime, timedelta
 from flask import Flask, jsonify
@@ -21,51 +22,71 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(bot)
 dp.middleware.setup(LoggingMiddleware())
 
-active_battles = {}  # для временных битв (в памяти)
+active_battles = {}  # словарь для временных битв (в памяти)
 
-# ---------- Работа с БД ----------
+# ---------- Работа с БД (с защитой) ----------
 async def init_db():
-    """Создаёт таблицы, если их нет"""
-    conn = await asyncpg.connect(DATABASE_URL)
-    await conn.execute('''
-        CREATE TABLE IF NOT EXISTS players (
-            user_id BIGINT PRIMARY KEY,
-            username TEXT,
-            level INT DEFAULT 1,
-            exp INT DEFAULT 0,
-            health INT DEFAULT 100,
-            max_health INT DEFAULT 100,
-            energy INT DEFAULT 100,
-            max_energy INT DEFAULT 100,
-            credits INT DEFAULT 1000,
-            monsters_killed INT DEFAULT 0,
-            last_daily TIMESTAMP
-        )
-    ''')
-    await conn.close()
-    print("✅ Таблицы созданы/проверены")
+    if not DATABASE_URL:
+        print("⚠️ DATABASE_URL не задана – работа без сохранения данных")
+        return
+    try:
+        conn = await asyncpg.connect(DATABASE_URL)
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS players (
+                user_id BIGINT PRIMARY KEY,
+                username TEXT,
+                level INT DEFAULT 1,
+                exp INT DEFAULT 0,
+                health INT DEFAULT 100,
+                max_health INT DEFAULT 100,
+                energy INT DEFAULT 100,
+                max_energy INT DEFAULT 100,
+                credits INT DEFAULT 1000,
+                monsters_killed INT DEFAULT 0,
+                last_daily TIMESTAMP
+            )
+        ''')
+        await conn.close()
+        print("✅ Таблицы созданы/проверены")
+    except Exception as e:
+        print(f"❌ Ошибка подключения к БД: {e}")
 
 async def get_player(user_id):
-    conn = await asyncpg.connect(DATABASE_URL)
-    row = await conn.fetchrow('SELECT * FROM players WHERE user_id = $1', user_id)
-    await conn.close()
-    return row
+    if not DATABASE_URL:
+        return None
+    try:
+        conn = await asyncpg.connect(DATABASE_URL)
+        row = await conn.fetchrow('SELECT * FROM players WHERE user_id = $1', user_id)
+        await conn.close()
+        return row
+    except:
+        return None
 
 async def create_player(user_id, username):
-    conn = await asyncpg.connect(DATABASE_URL)
-    await conn.execute('''
-        INSERT INTO players (user_id, username, last_daily) VALUES ($1, $2, NOW())
-    ''', user_id, username)
-    await conn.close()
+    if not DATABASE_URL:
+        return
+    try:
+        conn = await asyncpg.connect(DATABASE_URL)
+        await conn.execute('''
+            INSERT INTO players (user_id, username, last_daily) VALUES ($1, $2, NOW())
+        ''', user_id, username)
+        await conn.close()
+    except:
+        pass
 
 async def update_player(user_id, **kwargs):
-    set_clause = ', '.join(f"{k} = ${i+2}" for i, k in enumerate(kwargs))
-    values = [user_id] + list(kwargs.values())
-    conn = await asyncpg.connect(DATABASE_URL)
-    await conn.execute(f'UPDATE players SET {set_clause} WHERE user_id = $1', *values)
-    await conn.close()
+    if not DATABASE_URL:
+        return
+    try:
+        set_clause = ', '.join(f"{k} = ${i+2}" for i, k in enumerate(kwargs))
+        values = [user_id] + list(kwargs.values())
+        conn = await asyncpg.connect(DATABASE_URL)
+        await conn.execute(f'UPDATE players SET {set_clause} WHERE user_id = $1', *values)
+        await conn.close()
+    except:
+        pass
 
-# ---------- Команды бота (адаптированы под БД) ----------
+# ---------- Команды бота ----------
 @dp.message_handler(commands=['start'])
 async def cmd_start(message: types.Message):
     user_id = message.from_user.id
@@ -214,17 +235,23 @@ async def cmd_daily(message: types.Message):
 
 @dp.message_handler(commands=['top'])
 async def cmd_top(message: types.Message):
-    conn = await asyncpg.connect(DATABASE_URL)
-    rows = await conn.fetch('SELECT username, level, monsters_killed FROM players ORDER BY level DESC, monsters_killed DESC LIMIT 5')
-    await conn.close()
-    if not rows:
-        await message.reply("Пока нет игроков")
+    if not DATABASE_URL:
+        await message.reply("Топ недоступен без базы данных")
         return
-    text = "🏆 **ТОП ИГРОКОВ**\n\n"
-    for i, r in enumerate(rows, 1):
-        name = r['username'] or f"Игрок{i}"
-        text += f"{i}. {name} - Ур.{r['level']} (👾 {r['monsters_killed']})\n"
-    await message.reply(text, parse_mode="Markdown")
+    try:
+        conn = await asyncpg.connect(DATABASE_URL)
+        rows = await conn.fetch('SELECT username, level, monsters_killed FROM players ORDER BY level DESC, monsters_killed DESC LIMIT 5')
+        await conn.close()
+        if not rows:
+            await message.reply("Пока нет игроков")
+            return
+        text = "🏆 **ТОП ИГРОКОВ**\n\n"
+        for i, r in enumerate(rows, 1):
+            name = r['username'] or f"Игрок{i}"
+            text += f"{i}. {name} - Ур.{r['level']} (👾 {r['monsters_killed']})\n"
+        await message.reply(text, parse_mode="Markdown")
+    except Exception as e:
+        await message.reply("Ошибка получения топа")
 
 @dp.message_handler(commands=['shop'])
 async def cmd_shop(message: types.Message):
@@ -288,16 +315,16 @@ def run_flask():
 
 # ---------- Запуск ----------
 if __name__ == '__main__':
-    # Инициализация БД
+    # Инициализация цикла событий
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     loop.run_until_complete(init_db())
 
-    # Запуск Flask в фоне
+    # Запуск Flask в фоновом потоке
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
     print(f"🚀 Flask запущен в фоновом потоке на порту {PORT}")
 
-    # Запуск бота
+    # Запуск бота (polling)
     print("🚀 Запуск бота в режиме polling...")
     executor.start_polling(dp, skip_updates=True, loop=loop)
